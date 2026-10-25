@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class SyncGoogleSheetRequest(BaseModel):
+    """Options for ``POST /api/registration/sync-google-sheet``.
+
+    ``dry_run`` defaults to ``True``: the sheet is read, validated and reported
+    without a single row being written to PostgreSQL.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    dry_run: bool = True
+    spreadsheet_id: str | None = None
+    sheet_name: str | None = None
+    header_row: int | None = Field(default=None, ge=1)
+    data_start_row: int | None = Field(default=None, ge=2)
+    limit: int | None = Field(default=None, ge=1, le=5000)
+
+
+class SyncGoogleSheetPhotosRequest(SyncGoogleSheetRequest):
+    """Options for ``POST /api/registration/sync-google-sheet-photos``.
+
+    Runs the sheet import and then copies/replaces the member and spouse photos
+    in cloud storage. Photos are processed a batch at a time because a request
+    has a wall clock; page through them with ``photo_offset`` until the photo
+    summary reports ``has_more=false``.
+    """
+
+    photo_limit: int = Field(default=50, ge=1, le=200)
+    photo_offset: int = Field(default=0, ge=0)
+
+
+class SyncGoogleSheetGroupsRequest(BaseModel):
+    """Options for ``POST /api/registration/sync-google-sheet-groups``.
+
+    Materializes the group names found on the registration sheet and in the
+    member directory into the ``social_groups`` table, so the Groups CRUD API
+    can list, edit and delete every group.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    include_sheet: bool = True
+    include_member_data: bool = True
+    link_members: bool = True
+
+
+
+class RowIssue(BaseModel):
+    """A validation problem found on one sheet row."""
+
+    row: int
+    column: str | None = None
+    message: str
+
+
+class RowResult(BaseModel):
+    """What happened (or would happen) to one sheet row."""
+
+    row: int
+    action: str
+    name: str | None = None
+    phone: str | None = None
+    reason: str | None = None
+
+
+class SyncGoogleSheetResponse(BaseModel):
+    success: bool = True
+    message: str
+    dry_run: bool
+    spreadsheet_id: str
+    sheet_name: str
+    header_row: int
+    data_start_row: int
+    total_rows: int
+    inserted: int = 0
+    linked_existing_user: int = 0
+    # Rows whose sheet values were merged into an existing member.
+    updated: int = 0
+    skipped_duplicate: int = 0
+    failed: int = 0
+    # members columns created (or, on a dry run, that would be created) for
+    # headers the registration mapping does not know.
+    new_columns: list[str] = []
+    columns: list[str] = []
+    unmapped_columns: list[str] = []
+    missing_columns: list[str] = []
+    errors: list[RowIssue] = []
+    warnings: list[RowIssue] = []
+    rows: list[RowResult] = []

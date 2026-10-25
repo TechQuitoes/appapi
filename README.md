@@ -1,0 +1,460 @@
+# JSSG API – Centralized Jain Community Digital Platform
+
+Backend for the **Jain Social Group** federated platform: a centralized directory of
+Jain communities — **Federation → Region → Social Group → Trustees → Members** — with
+events, news, notifications, media, advertisements, federation fees and payments.
+
+Built to be consumed by a **Flutter mobile app** and a **React/Next.js admin panel**.
+Content is primarily Hindi; all models carry `*_hi` fields so multilingual support can
+be added later without schema redesign.
+
+## Architecture
+
+```
+Flutter / Admin Panel
+        │  HTTPS / JSON
+        ▼
+   Cloudflare (DNS, CDN, SSL, WAF)
+        ▼
+      Fly.io → FastAPI (Uvicorn, async)
+                 │
+        ┌────────┼──────────┐
+        ▼        ▼          ▼
+   PostgreSQL   Redis   Cloudflare R2
+   (SQLAlchemy,       (cache,     (photos / videos / media)
+    Alembic)           jobs, rate limit)
+        |
+   Firebase Cloud Messaging (push to Flutter)
+```
+
+Design conventions
+
+- **Routers** validate input and delegate; no business logic.
+- **Services** contain business logic.
+- **Repositories** perform database operations.
+- **Integrations** wrap external providers (R2, Firebase, email, payment gateways).
+- **Workers** handle background jobs (notifications, payments, media).
+- All responses use a consistent envelope (see "API conventions").
+
+## Tech stack
+
+| Layer       | Choice                                             |
+|-------------|----------------------------------------------------|
+| Framework   | FastAPI (async)                                    |
+| ORM         | SQLAlchemy 2.x (typed `Mapped`/`mapped_column`)    |
+| Migrations  | Alembic                                            |
+| Validation  | Pydantic v2                                        |
+| Auth        | JWT (access + refresh), bcrypt                     |
+| Database    | PostgreSQL 16                                      |
+| Cache/Jobs  | Redis                                              |
+| Media       | Cloudflare R2                                      |
+| Push        | Firebase Cloud Messaging                           |
+| Deploy      | Fly.io + Docker, Cloudflare in front               |
+
+## Repository layout
+
+```
+app/
+├── main.py                 # FastAPI app + lifespan + global handlers
+├── config.py               # Pydantic-settings based configuration
+├── database.py             # Async engine + session factory
+├── dependencies.py         # get_db, get_current_user, etc.
+├── core/                   # security, jwt, permissions, exceptions, constants, responses
+├── models/                 # SQLAlchemy models (UUID PKs, timestamps, soft delete)
+├── schemas/                # Pydantic request/response schemas
+├── api/v1/                 # versioned routers
+├── services/               # business logic
+├── repositories/           # data-access layer
+├── integrations/           # R2, Firebase, email, payment gateway adapters
+├── workers/                # background job entry points
+├── utils/                  # pagination, validators, file_upload, helpers
+└── data/                   # bootstrap seed data (roles, permissions)
+migrations/                 # Alembic migrations
+tests/                      # pytest suite
+```
+
+## Local development
+
+### Prerequisites
+
+- Python 3.11+
+- PostgreSQL 16
+- Redis 7 (optional locally; only needed for cache/rate-limit/jobs)
+- Docker (optional; `docker compose` path below)
+
+### 1. Environment
+
+```bash
+cp .env.example .env
+# then edit .env with your local values
+```
+
+### 2. Python environment
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -r requirements-dev.txt   # dev tooling
+```
+
+### 3. Database setup
+
+```sql
+CREATE ROLE jssg WITH LOGIN PASSWORD 'jssg_secret';
+CREATE DATABASE jssg_db OWNER jssg;
+```
+
+Point `DATABASE_URL` in `.env` at it, e.g.:
+
+```
+DATABASE_URL=postgresql+asyncpg://jssg:jssg_secret@localhost:5432/jssg_db
+```
+
+### 4. Run migrations
+
+```bash
+alembic upgrade head
+```
+
+On every model change:
+
+```bash
+alembic revision --autogenerate -m "describe change"
+alembic upgrade head
+```
+
+Rollback one step:
+
+```bash
+alembic downgrade -1
+```
+
+> `DATABASE_URL` configured as `postgresql+asyncpg://` is used as-is by the app;
+> Alembic automatically resolves the sync `psycopg2` driver.
+>
+> Hosted Postgres providers (e.g. Neon via Vercel) often supply a plain
+> `postgresql://` connection string. The app automatically rewrites it to
+> `postgresql+asyncpg://` so the async engine always uses asyncpg; set
+> `DATABASE_URL` in Vercel to your Neon connection string (either form works).
+
+### 5. Run the API
+
+```bash
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+- Interactive docs: <http://localhost:8000/docs>
+- ReDoc: <http://localhost:8000/redoc>
+- OpenAPI JSON: <http://localhost:8000/openapi.json>
+- Health: <http://localhost:8000/health>
+
+On first boot the app seeds the five roles, the full permission set, and (in
+non-production environments) a default super admin:
+
+- email: `superadmin@jssg.local`
+- password: `ChangeMe123!`
+
+**Change or remove it immediately in any shared environment.**
+
+### 6. Run tests
+
+```bash
+pytest
+```
+
+Use an isolated/stem database for tests; tests must never touch production services.
+
+### 7. Schema drift check (deployed environments)
+
+`asyncpg.exceptions.UndefinedColumnError: column members.profile_data does not exist`
+means the deployed database is behind the models. This happens when a revision
+gets **stamped** without its DDL actually executing — `alembic upgrade head` is
+then a silent no-op and the column is never created.
+
+Compare the models against the live schema, every column of every table:
+
+```bash
+python -m scripts.drift_check            # report, exit 1 if anything is missing
+python -m scripts.drift_check --sql      # also print idempotent DDL to fix it
+```
+
+The target database comes from `DATABASE_URL`, so the same command works against
+local, staging and production:
+
+```bash
+DATABASE_URL='postgresql://user:pass@host/db?sslmode=require' python -m scripts.drift_check
+```
+
+It separates **blocking** drift (missing tables/columns — these break queries at
+runtime) from **advisory** drift (indexes, types, nullability, extra columns),
+and reports `alembic_version` against the repo's head.
+
+**Fixing a drifted environment**
+
+```bash
+# 1. confirm what is missing
+python -m scripts.drift_check --sql
+
+# 2a. preferred - run the migration chain (all DDL is idempotent)
+alembic upgrade head
+
+# 2b. or apply the printed DDL directly
+psql "$DATABASE_URL" -c 'ALTER TABLE members ADD COLUMN IF NOT EXISTS profile_data JSONB;'
+
+# 3. verify
+python -m scripts.drift_check    # expect: no blocking drift
+```
+
+If `drift_check` reports `alembic_version table: ABSENT`, the database predates
+Alembic. `alembic upgrade head` will fail with `DuplicateTable`, so **after**
+confirming the schema matches the models, adopt the current chain instead of
+replaying it:
+
+```bash
+python -m scripts.drift_check   # must report no blocking drift first
+alembic stamp head
+```
+
+Revision `e6f1a2b3c4d5` (`repair members column drift`) is the safety net: it
+reconciles every `Member` column plus the `members` indexes, adding `NOT NULL`
+columns in three steps (add nullable → backfill → enforce) so it also succeeds
+on a populated table.
+
+> Deployment rule: never `alembic stamp` a revision you have not verified with
+> `drift_check`, and never deploy code whose migrations have not been applied to
+> the target database first. Run `python -m scripts.drift_check` in CI against a
+> database built from the migration chain to catch this before it ships.
+
+## Docker Compose (local)
+
+```bash
+cp .env.example .env          # defaults match docker-compose.yml
+docker compose up --build
+```
+
+Starts three services:
+
+- `db` – PostgreSQL 16 on `5432`
+- `redis` – Redis 7 on `6379`
+- `api` – FastAPI on `8000`, runs `alembic upgrade head` at boot
+
+## API conventions
+
+### Authentication
+
+All authenticated endpoints require:
+
+```
+Authorization: Bearer <access_token>
+```
+
+- Access tokens expire after `ACCESS_TOKEN_EXPIRE_MINUTES` (default 30 min).
+- Refresh tokens expire after `REFRESH_TOKEN_EXPIRE_DAYS` (default 7 days).
+- Refresh tokens are stored hashed server-side and revocable.
+
+### Response envelope
+
+Success:
+
+```json
+{
+  "success": true,
+  "message": "Member fetched successfully",
+  "data": { }
+}
+```
+
+Paginated:
+
+```json
+{
+  "success": true,
+  "data": [],
+  "pagination": {
+    "page": 1,
+    "page_size": 20,
+    "total": 100,
+    "total_pages": 5
+  }
+}
+```
+
+Error:
+
+```json
+{
+  "success": false,
+  "message": "Member not found",
+  "error_code": "MEMBER_NOT_FOUND"
+}
+```
+
+Standard error codes: `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`,
+`ALREADY_EXISTS`, `VALIDATION_ERROR`, `BAD_REQUEST`.
+
+### Versioning
+
+Endpoints are versioned: `/api/v1/<resource>`. Client + server agree on the version;
+breaking changes ship new versions, existing structures stay stable for Flutter.
+
+## Environment variables
+
+See [`.env.example`](.env.example) for the full list, including:
+
+- `APP_NAME`, `APP_ENV`, `APP_DEBUG`, `APP_HOST`, `APP_PORT`
+- `DATABASE_URL`
+- `JWT_SECRET`, `JWT_ALGORITHM`, `ACCESS_TOKEN_EXPIRE_MINUTES`, `REFRESH_TOKEN_EXPIRE_DAYS`
+- `REDIS_URL`
+- `CLOUDFLARE_R2_*` (endpoint, access key, secret key, bucket, public URL)
+- `FIREBASE_PROJECT_ID`, `FIREBASE_PRIVATE_KEY`, `FIREBASE_CLIENT_EMAIL`
+- `PAYMENT_PROVIDER`, `PAYMENT_KEY`, `PAYMENT_SECRET`, `PAYMENT_WEBHOOK_SECRET`
+- `CORS_ORIGINS`
+
+**Never commit `.env` or any real secret.** `.env` is gitignored.
+
+## Security
+
+- bcrypt password hashing (never plain text).
+- JWT access/refresh tokens; refresh tokens stored hashed and revocable.
+- RBAC with separately modeled permissions (extensible).
+- Authorization enforced server-side on every admin endpoint.
+- File uploads validated by MIME type and size, never by extension alone.
+- ORM everywhere (parameterized queries → no raw SQL injection surface).
+- CORS restricted to `CORS_ORIGINS`.
+- Logging never includes passwords, tokens, or secrets.
+- Webhooks verify gateway signatures before trust.
+
+## Cloudflare R2 (media)
+
+Media files are stored in R2; PostgreSQL stores only metadata (owner, name, type,
+size, object key, URL). The `MediaService`/`CloudflareR2Client` abstraction lets the
+storage provider be swapped later without touching business logic.
+
+Set:
+
+```
+CLOUDFLARE_R2_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+CLOUDFLARE_R2_ACCESS_KEY=...
+CLOUDFLARE_R2_SECRET_KEY=...
+CLOUDFLARE_R2_BUCKET=jssg-media
+CLOUDFLARE_R2_PUBLIC_URL=https://media.yourdomain.com
+```
+
+Wire your domain to the bucket in the Cloudflare dashboard and add a CNAME to the R2
+bucket for a clean CDN-enabled public URL.
+
+If the bucket has no public domain, `media.url` points at
+`/api/v1/media/{id}/content`, which streams the bytes and serves public media
+anonymously. When a media row points at an object that is not in the bucket, that
+route answers `503 MEDIA_NOT_FOUND` rather than an unhandled `500`.
+
+### Google Drive photo links
+
+Member photos imported from the Google Sheet are `drive.google.com` share links,
+which the Flutter app cannot render with `Image.network`: an unshared file
+resolves to an `accounts.google.com` sign-in page, and a shared one to Drive's
+HTML preview. `DrivePhotoMigration` copies those bytes into R2 and repoints
+`member_photo_link` / `profile_photo_url` at a URL that returns `image/*` with no
+cookies and no headers.
+
+```bash
+# see what would change, write nothing (also the endpoint's default)
+.venv/bin/python -m scripts.migrate_drive_photos --dry-run
+
+# migrate, in batches
+.venv/bin/python -m scripts.migrate_drive_photos --apply --all
+```
+
+Or through the admin API, which defaults to `dry_run=true`:
+
+```
+POST /api/v1/media/migrate-drive-photos?dry_run=true
+```
+
+To import the sheet and copy/replace the photos in one call, use the combined
+admin route (requires `member.create` and `media.migrate`). It writes nothing
+unless `dry_run=false` and `GOOGLE_SHEETS_SYNC_ENABLED=true`, and pages the
+photos with `photo_limit` / `photo_offset` until `photos.has_more` is `false`:
+
+```
+POST /api/registration/sync-google-sheet-photos
+{ "dry_run": true, "photo_limit": 50, "photo_offset": 0 }
+```
+
+Requires the `media.migrate` permission (ADMIN / SUPER_ADMIN). Properties:
+
+- Nothing in Drive is modified. No file is shared, renamed, moved or deleted.
+- The original link is kept on the member as `profile_photo_drive_url` /
+  `spouse_photo_drive_url`, so a photo stays re-syncable from the sheet.
+- Idempotent: a photo is copied at most once, and later runs report
+  `already_migrated`. If a stored object later disappears, the preserved Drive
+  link is used to copy it again.
+- A changed sheet link **replaces** the stored photo: the new bytes are copied,
+  the member is repointed, and the superseded R2 object (and its `media` row) is
+  deleted. Those runs report `replaced`.
+- A photo that cannot be read is reported in `failures` with the member, the
+  field, the original link and the reason; it does not stop the batch.
+- A file is fetched through the configured service account, or anonymously when
+  it is shared "anyone with the link". A file that is private to both fails with a
+  reason naming the fix - either share the folder with the service account
+  address, or share the file "anyone with the link".
+
+## Firebase Cloud Messaging
+
+Notifications flow: FastAPI → FCM → Flutter.
+
+- App registers a device token via `POST /api/v1/notifications/device-token`.
+- Broadcasts to large audiences run through background workers.
+- Notification history (`Notification`) is stored in PostgreSQL.
+
+Requires `FIREBASE_PROJECT_ID`, `FIREBASE_PRIVATE_KEY`, `FIREBASE_CLIENT_EMAIL`
+(or a service-account file for local dev).
+
+## Fly.io deployment
+
+1. Create the app and Postgres:
+
+   ```bash
+   fly launch
+   fly postgres create --name jssg-db
+   fly postgres attach jssg-db --app jssg-api
+   ```
+
+2. Set secrets (never in `fly.toml`):
+
+   ```bash
+   fly secrets set \
+     JWT_SECRET=<long-random> \
+     DATABASE_PASSWORD=<postgres-password> \
+     CLOUDFLARE_R2_ACCESS_KEY=... \
+     CLOUDFLARE_R2_SECRET_KEY=... \
+     FIREBASE_PRIVATE_KEY='...' \
+     PAYMENT_SECRET=... \
+     PAYMENT_WEBHOOK_SECRET=...
+   ```
+
+3. Deploy:
+
+   ```bash
+   fly deploy
+   ```
+
+The app listens on `0.0.0.0:8000` with a `/health` HTTP check. Point Cloudflare at
+the Fly.io hostname (CNAME) and enable proxy for SSL/CDN/WAF.
+
+## Documentation / roadmap
+
+Phases still in progress (implemented incrementally, each verified before moving on):
+
+- [x] Phase 1 – Project setup, FastAPI, SQLAlchemy 2.x, Alembic, Docker, config
+- [ ] Phase 2 – User, authentication, JWT, roles, permissions
+- [ ] Phase 3 – Locations, groups, members, trustees
+- [ ] Phase 4 – Family, professional info, search
+- [ ] Phase 5 – Events, news, notifications
+- [ ] Phase 6 – Media + Cloudflare R2
+- [ ] Phase 7 – Advertisements
+- [ ] Phase 8 – Fees + payments
+- [ ] Phase 9 – Reports, audit logs (foundations seeded)
+- [ ] Phase 10 – Tests, security review, docs
+- [ ] Phase 11 – Production Docker, Fly.io, Cloudflare config
